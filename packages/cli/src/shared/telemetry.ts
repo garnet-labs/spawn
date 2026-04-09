@@ -55,6 +55,55 @@ const SENSITIVE_PATTERNS: [
   ],
 ];
 
+/**
+ * Parse a JS Error stack string into PostHog stack frames.
+ * Each line like "    at functionName (filename:line:col)" becomes a frame.
+ */
+function parseStackFrames(stack: string): {
+  platform: string;
+  function: string;
+  filename: string;
+  lineno?: number;
+  colno?: number;
+  in_app: boolean;
+}[] {
+  const frames: {
+    platform: string;
+    function: string;
+    filename: string;
+    lineno?: number;
+    colno?: number;
+    in_app: boolean;
+  }[] = [];
+  for (const line of stack.split("\n")) {
+    const match = /^\s+at\s+(?:(.+?)\s+\((.+?):(\d+):(\d+)\)|(.+?):(\d+):(\d+))/.exec(line);
+    if (!match) {
+      continue;
+    }
+    const fn = match[1] || "<anonymous>";
+    const file = scrub(match[2] || match[5] || "<unknown>");
+    const lineno = Number(match[3] || match[6]);
+    const colno = Number(match[4] || match[7]);
+    frames.push({
+      platform: "node:javascript",
+      function: fn,
+      filename: file,
+      ...(lineno
+        ? {
+            lineno,
+          }
+        : {}),
+      ...(colno
+        ? {
+            colno,
+          }
+        : {}),
+      in_app: !file.includes("node_modules"),
+    });
+  }
+  return frames;
+}
+
 /** Scrub sensitive data from a string before sending to telemetry. */
 function scrub(text: string): string {
   let result = text;
@@ -128,21 +177,52 @@ export function captureWarning(message: string): void {
   });
 }
 
-/** Capture an error event. */
+/** Map our error types to PostHog mechanism types. */
+function mechanismType(type: string): string {
+  switch (type) {
+    case "uncaught_exception":
+      return "onuncaughtexception";
+    case "unhandled_rejection":
+      return "onunhandledrejection";
+    default:
+      return "generic";
+  }
+}
+
+/** Capture an error as a $exception event (shows in PostHog Error Tracking). */
 export function captureError(type: string, err: unknown): void {
   if (!_enabled) {
     return;
   }
   const message = err instanceof Error ? err.message : String(err);
   const stack = err instanceof Error ? err.stack : undefined;
-  pushEvent("cli_error", {
+  const scrubbedMessage = scrub(message);
+
+  const exceptionEntry: Record<string, unknown> = {
     type,
-    message: scrub(message),
-    ...(stack
-      ? {
-          stack: scrub(stack),
-        }
-      : {}),
+    value: scrubbedMessage,
+    mechanism: {
+      handled: type === "log_error",
+      type: mechanismType(type),
+      synthetic: !(err instanceof Error),
+    },
+  };
+
+  if (stack) {
+    const frames = parseStackFrames(stack);
+    if (frames.length > 0) {
+      exceptionEntry.stacktrace = {
+        type: "raw",
+        frames,
+      };
+    }
+  }
+
+  pushEvent("$exception", {
+    $exception_list: [
+      exceptionEntry,
+    ],
+    $exception_level: "error",
   });
 }
 
