@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Trusted default-branch workflow_run collector. Artifact contents are data only.
+// Explicitly dispatched trusted default-branch collector. Artifacts are data only.
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -40,17 +40,33 @@ export function validateCollectMetadata(a, name, run) {
     /^sha256:[a-f0-9]{64}$/.test(a.digest || ''), 'untrusted_artifact_metadata');
 }
 
+export function waitForCompletedRun(repo, runId, {
+  authorize = authorizeCI,
+  sleep = ms => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms),
+  attempts = 25, interval = 5000,
+} = {}) {
+  // The verifier dispatches after upload, just before its worker run closes.
+  // Authorization is repeated during this bounded wait; changed attempts/SHAs
+  // fail immediately. No artifact is downloaded before completed is observed.
+  for (let i = 0; i < attempts; i++) {
+    const trust = authorize(repo, runId, {allowInProgress: true});
+    if (trust.run.status === 'completed') return trust;
+    if (i + 1 < attempts) sleep(interval);
+  }
+  throw new Error('worker_completion_wait_expired');
+}
+
 export function collectorMain() {
-  assert(process.env.GITHUB_ACTIONS === 'true' && process.env.GITHUB_EVENT_NAME === 'workflow_run',
-    'collector_requires_trusted_workflow_run');
+  assert(process.env.GITHUB_ACTIONS === 'true' && process.env.GITHUB_EVENT_NAME === 'workflow_dispatch',
+    'collector_requires_trusted_workflow_dispatch');
   const repo = process.env.GITHUB_REPOSITORY;
   assert(/^garnet-labs\/[A-Za-z0-9_.-]+$/.test(repo || ''), 'invalid_repository');
   const event = JSON.parse(read(process.env.GITHUB_EVENT_PATH, MB));
-  assert(numeric(event.workflow_run?.id), 'invalid_triggering_run');
-  const runId = String(event.workflow_run.id);
+  assert(numeric(event.inputs?.run_id), 'invalid_triggering_run');
+  const runId = String(event.inputs.run_id);
   // Live path, ID, branch, same-repository identity, attempt and ancestry checks
   // precede every artifact download, not merely publication.
-  const {run} = authorizeCI(repo, runId);
+  const {run} = waitForCompletedRun(repo, runId);
   const metadata = pages(`repos/${repo}/actions/runs/${runId}/artifacts`, 'artifacts');
   const root = fs.mkdtempSync(path.join(process.env.RUNNER_TEMP || os.tmpdir(), 'garnet-read-only-data-'));
   fs.chmodSync(root, 0o700);

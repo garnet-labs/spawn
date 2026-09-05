@@ -8,11 +8,20 @@ import crypto from 'node:crypto';
 import dns from 'node:dns/promises';
 import {spawn, spawnSync} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
-import {planAdditionalLockfile} from './garnet-additional-lockfiles.mjs';
+import {planAdditionalLockfile, planBunLockfile, reviewedImageTag, assertNoUnselectedBun} from './garnet-additional-lockfiles.mjs';
 
 export const POLICY = 'garnet-dependabot-container-v2';
+// Additive capability marker for the independent publisher. Legacy v2 code
+// without this marker must retain its own historical validation contract.
+export const REVIEWED_EXCEPTIONS_VERSION = 1;
 export const ACTION = 'e546567a72e4fede11ec39d6e9f75b539adef22c';
 export const SENSOR = 'v2.16.0';
+// These bounds are ALREADY deployed in the audited failed sensor runs; they
+// are coordinated limits, not evidence that a heavy flush will finish.
+export const FINALIZATION_LIMITS = Object.freeze({
+  sensor_stop_seconds: 180, stop_command_ms: 240000,
+  settle_ms: 30000, step_minutes: 6, diagnostic_command_ms: 10000,
+});
 export const IMAGE_TAGS = Object.freeze({
   node: 'node:22-bookworm', python: 'python:3.12-bookworm',
   go: 'golang:1.26-bookworm', rust: 'rust:1-bookworm', ruby: 'ruby:3.3-bookworm',
@@ -87,7 +96,7 @@ export function validateSnapshot(s) {
 
 export function ecosystem(file) {
   const name = path.posix.basename(safePath(file));
-  if (/^(package\.json|package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|pnpm-workspace\.yaml|yarn\.lock)$/.test(name)) return 'node';
+  if (/^(package\.json|package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|pnpm-workspace\.yaml|yarn\.lock|bun\.lockb?)$/.test(name)) return 'node';
   if (/^(pyproject\.toml|uv\.lock|poetry\.lock|requirements[^/]*\.txt)$/.test(name)) return 'python';
   if (/^go\.(mod|sum)$/.test(name)) return 'go';
   if (/^Cargo\.(toml|lock)$/.test(name)) return 'rust';
@@ -95,22 +104,35 @@ export function ecosystem(file) {
   return null;
 }
 
-// Reject symlink parents as well as the leaf before any host file read. Whole
-// checkout validation later also rejects outbound/dangling symlinks and gitlinks.
+// Reject symlink parents/leaves before host reads, including dangling optional
+// manifests. The only opaque copy exception below never waives this reader.
 export function readSource(root, relative, optional = false) {
   safePath(relative);
+  assertWorkloadDirectory(root, '.');
   let cursor = root;
   for (const component of relative.split('/')) {
     cursor = path.join(cursor, component);
-    if (!fs.existsSync(cursor)) {
+    let stat;
+    try { stat = fs.lstatSync(cursor); }
+    catch (error) {
+      if (error.code !== 'ENOENT') throw error;
       if (optional) return null;
       throw new Error(`Missing required manifest: ${relative}`);
     }
-    assert(!fs.lstatSync(cursor).isSymbolicLink(), 'Symlink manifest or parent is blocked');
+    assert(!stat.isSymbolicLink(), 'Symlink manifest or parent is blocked');
   }
-  const stat = fs.statSync(cursor);
+  const stat = fs.lstatSync(cursor);
   assert(stat.isFile() && stat.size <= 8 * 1024 * 1024, 'Manifest is not a bounded regular file');
   return fs.readFileSync(cursor, 'utf8');
+}
+export function assertWorkloadDirectory(root, directory) {
+  if (directory !== '.') safePath(directory);
+  let cursor = root;
+  for (const component of ['', ...(directory === '.' ? [] : directory.split('/'))]) {
+    if (component) cursor = path.join(cursor, component);
+    const stat = fs.lstatSync(cursor);
+    assert(stat.isDirectory() && !stat.isSymbolicLink(), 'Symlink or non-directory workload path blocked');
+  }
 }
 const joined = (dir, file) => dir === '.' ? file : `${dir}/${file}`;
 const exists = (root, dir, file) => readSource(root, joined(dir, file), true) !== null;
@@ -126,10 +148,121 @@ function managerSpec(value) {
   return {name: match[1], version: match[2]};
 }
 
+// Parent-reviewed, immutable-pair exceptions. No PR-controlled policy file,
+// dispatch flag, broad manager override or general allowAbsolute switch.
+const REVIEWED_EXTENSION = Object.freeze({
+  repository: 'garnet-labs/vscode-extension-test', repository_id: '899092823', pr_number: 5,
+  baseline_sha: '393e349d14a10f2db1ce266c42db378ac6391a93',
+  head_sha: 'f43f9f252cab4c3ee9f29a7bcf58f859a35b759b',
+  manifests: ['sema4ai/package-lock.json', 'sema4ai/yarn.lock'],
+});
+const REVIEWED_NEXT = Object.freeze({
+  repository: 'garnet-labs/next.js', repository_id: '1206332346', pr_number: 40,
+  baseline_sha: '2d069943639fd0fc67a26bbb337d8a726f50924d',
+  head_sha: 'bcae068be948a03cba54813aea6cffb5c03adf63',
+  manifests: ['package.json', 'pnpm-lock.yaml'],
+});
+// Both immutable release workflows set working-directory ./sema4ai and
+// execute yarn install. Same blobs at both reviewed revisions:
+// https://github.com/garnet-labs/vscode-extension-test/blob/393e349d14a10f2db1ce266c42db378ac6391a93/.github/workflows/release-robocorp-code-vscode.yml#L9-L23
+// https://github.com/garnet-labs/vscode-extension-test/blob/f43f9f252cab4c3ee9f29a7bcf58f859a35b759b/.github/workflows/pre-release-robocorp-code.yml#L11-L29
+const EXTENSION_AUTHORITY = Object.freeze({
+  '.github/workflows/release-robocorp-code-vscode.yml': '41a3063623d70bc9d6c61f7b0aa85c42db85481d',
+  '.github/workflows/pre-release-robocorp-code.yml': 'da08cb83e92c0a6576bdf824f2d2dbe6b20dd07a',
+  'sema4ai/package.json': '448bde4b09f254aee686b3bf63362c619bc60ff6',
+});
+const EXTENSION_LOCKS = Object.freeze({
+  [REVIEWED_EXTENSION.baseline_sha]: {
+    'sema4ai/yarn.lock': 'a2e2ba93941e47895ba816f633f3bff22f30c08e',
+    'sema4ai/package-lock.json': '322988a2e68ed3d3a2b5bdd11cceedaca9ded1f2',
+  },
+  [REVIEWED_EXTENSION.head_sha]: {
+    'sema4ai/yarn.lock': '38877bfff2c010707b9998c37cd3102f56630490',
+    'sema4ai/package-lock.json': '785df566266e81c25259a41390be9ded26889201',
+  },
+});
+// Same Git symlink blob on both revisions; outside declared workspace globs:
+// https://api.github.com/repos/garnet-labs/next.js/git/blobs/07ab05517e672a857a940573789969bfb1de3848
+// https://github.com/garnet-labs/next.js/blob/2d069943639fd0fc67a26bbb337d8a726f50924d/pnpm-workspace.yaml
+const NEXT_OPAQUE_FIXTURE = Object.freeze({
+  path: 'test/development/app-dir/ssr-in-rsc/node_modules/random-react-library',
+  target: '/Users/sebbie/repos/next.js/test/development/app-dir/ssr-in-rsc/random-react-library/',
+  blob_sha: '07ab05517e672a857a940573789969bfb1de3848',
+  host_target_resolved: false,
+});
+const gitBlob = text => crypto.createHash('sha1')
+  .update(`blob ${Buffer.byteLength(text)}\0`).update(text).digest('hex');
+const equalData = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+function reviewedPair(context, approved) {
+  const s = context?.snapshot;
+  const matches = s?.repository === approved.repository && s.repository_id === approved.repository_id &&
+    s.pr_number === approved.pr_number && s.baseline_sha === approved.baseline_sha &&
+    s.head?.sha === approved.head_sha && [approved.baseline_sha, approved.head_sha].includes(context.executed_sha) &&
+    Array.isArray(s.manifests) && s.manifests.length === approved.manifests.length &&
+    approved.manifests.every(file => s.manifests.includes(file));
+  if (matches) validateSnapshot(s);
+  return matches;
+}
+export function reviewedExceptionContract(context) {
+  const extension = reviewedPair(context, REVIEWED_EXTENSION);
+  const next = reviewedPair(context, REVIEWED_NEXT);
+  return {
+    manager_selection: extension ? {
+      policy_id: 'vscode-extension-test-pr5-sema4ai-yarn-v1',
+      manager: 'yarn', version: '1.22.22', version_authority: 'trusted-classic-lock-fallback',
+      selected_lockfile: 'sema4ai/yarn.lock',
+      unused_competing_lockfiles: ['sema4ai/package-lock.json'],
+      changed_lockfiles_not_independently_exercised: ['sema4ai/package-lock.json'],
+      authority_blobs: {...EXTENSION_AUTHORITY},
+      authority_commit_pair: [REVIEWED_EXTENSION.baseline_sha, REVIEWED_EXTENSION.head_sha],
+      source_lock_blobs: {...EXTENSION_LOCKS[context.executed_sha]},
+    } : null,
+    source_copy_fidelity: next ? {
+      policy_id: 'nextjs-pr40-exact-fixture-link-preservation-v1',
+      method: 'no-dereference-copy', git_metadata_excluded: true,
+      excluded_tracked_source_paths: [], rewritten_symlink_targets: [],
+      preserved_opaque_symlinks: [{...NEXT_OPAQUE_FIXTURE}],
+      fidelity: 'regular-file bytes and symlink target bytes preserved; existing git-metadata exclusion and executable-mode normalization unchanged',
+    } : null,
+  };
+}
+function reviewedExtensionCommands() {
+  return [
+    "garnet_locks_before=$(/usr/bin/sha256sum 'yarn.lock' 'package-lock.json'); readonly garnet_locks_before",
+    'export COREPACK_ENABLE_PROJECT_SPEC=0 COREPACK_DEFAULT_TO_LATEST=0 YARN_IGNORE_PATH=1',
+    "corepack install --global 'yarn@1.22.22'",
+    'mkdir -p /home/workload/.local/bin',
+    'corepack enable --install-directory /home/workload/.local/bin yarn',
+    'corepack yarn install --frozen-lockfile --non-interactive --production=false',
+    "printf '%s\\n' \"$garnet_locks_before\" | /usr/bin/sha256sum --check --status",
+  ];
+}
+function reviewedNodePlan(root, file, kind, context) {
+  if (kind !== 'node' || !REVIEWED_EXTENSION.manifests.includes(file)) return null;
+  const selection = reviewedExceptionContract(context).manager_selection;
+  if (!selection) return null;
+  for (const [file, blob] of Object.entries({...selection.authority_blobs, ...selection.source_lock_blobs})) {
+    assert(gitBlob(readSource(root, file)) === blob, 'BLOCKED: reviewed Yarn authority/source bytes changed');
+  }
+  for (const file of ['sema4ai/pnpm-lock.yaml', 'sema4ai/npm-shrinkwrap.json']) {
+    assert(readSource(root, file, true) === null, 'BLOCKED: additional competing lockfile');
+  }
+  return {
+    directory: 'sema4ai', locked: true, commands: reviewedExtensionCommands(),
+    scope: 'reviewed-yarn-locked-install-with-lifecycle-hooks-no-explicit-workspace-build',
+    note: 'Immutable release workflows choose Yarn in sema4ai; 1.22.22 is the trusted classic-lock fallback, not an upstream version pin. npm lock retained but its graph is not independently installed.',
+    manager_selection: selection,
+  };
+}
+
 // Pure planner: file contents are data. It never imports package code, parses
 // Ruby as code, or installs planner dependencies from the source repository.
-export function planWorkloads(root, changed) {
+export function planWorkloads(root, changed, context) {
   const plans = new Map();
+  if (reviewedExceptionContract(context).manager_selection) {
+    assert(equalData([...changed].sort(), [...REVIEWED_EXTENSION.manifests].sort()),
+      'BLOCKED: reviewed Yarn changed-manifest scope mismatch');
+  }
   const recognized = changed.filter(file => ecosystem(file));
   assert(recognized.length > 0, 'BLOCKED: no supported changed dependency manifests (including action-only PRs)');
   for (const file of recognized) {
@@ -140,7 +273,9 @@ export function planWorkloads(root, changed) {
     let scope = 'dependency-install-with-lifecycle-hooks';
     let locked = true;
     let note = '';
-    const additional = planAdditionalLockfile({root, file, kind, read: readSource});
+    const reviewed = reviewedNodePlan(root, file, kind, context);
+    const bun = reviewed ? null : planBunLockfile({root, file, kind, read: readSource});
+    const additional = reviewed ?? bun ?? planAdditionalLockfile({root, file, kind, read: readSource});
     if (additional) {
       dir = additional.directory;
       commands.push(...additional.commands);
@@ -239,7 +374,8 @@ export function planWorkloads(root, changed) {
     }
     // Ancestor promotion can occur after the additional helper delegates.
     // Enforce ambiguity guards on the FINAL project, not just the changed path.
-    if (kind === 'node' && exists(root, dir, 'yarn.lock')) {
+    if (kind === 'node') assertNoUnselectedBun({root, directory: dir, selected: bun, read: readSource});
+    if (kind === 'node' && exists(root, dir, 'yarn.lock') && !reviewed) {
       assert(['pnpm-lock.yaml', 'package-lock.json', 'npm-shrinkwrap.json']
         .every(name => !exists(root, dir, name)),
       'BLOCKED: competing Node lockfiles at final selected project require reviewed upstream-workflow manager selection');
@@ -248,9 +384,11 @@ export function planWorkloads(root, changed) {
       assert(!(exists(root, dir, 'uv.lock') && exists(root, dir, 'poetry.lock')),
         'BLOCKED: both uv.lock and poetry.lock at final selected project require an explicit ecosystem policy');
     }
+    assertWorkloadDirectory(root, dir);
     const key = `${kind}:${dir}:${kind === 'python' && scope === 'requirements-install' ? path.posix.basename(file) : ''}`;
     if (plans.has(key)) plans.get(key).changed_manifests.push(file);
-    else plans.set(key, {id: key, ecosystem: kind, directory: dir, commands, scope, locked, note, changed_manifests: [file]});
+    else plans.set(key, {id: key, ecosystem: kind, directory: dir, commands, scope, locked, note, changed_manifests: [file],
+      ...(reviewed ? {manager_selection: reviewed.manager_selection} : {})});
   }
   assert(plans.size > 0 && plans.size <= 12, 'BLOCKED: workload count outside pilot bounds');
   return [...plans.values()].sort((a, b) => a.id.localeCompare(b.id));
@@ -269,11 +407,11 @@ const expectedSHA = (s, side) => side === 'base' ? s.baseline_sha : s.head.sha;
 const profileJob = (s, side) => `dependabot-${side}-attempt-${s.run_attempt}`;
 const artifactName = (s, side) => `garnet-record-${s.run_id}-${s.run_attempt}-${side}`;
 
-function validateImages(images, snapshot) {
+export function validateImages(images, snapshot) {
   for (const kind of new Set(snapshot.manifests.map(ecosystem).filter(Boolean))) {
-    assert(DIGEST.test(images?.[kind]?.digest) && images[kind].tag === IMAGE_TAGS[kind],
+    assert(DIGEST.test(images?.[kind]?.digest) && images[kind].tag === reviewedImageTag(snapshot, kind, IMAGE_TAGS[kind]),
       'Missing or invalid immutable image');
-    const repository = IMAGE_TAGS[kind].split(':')[0];
+    const repository = reviewedImageTag(snapshot, kind, IMAGE_TAGS[kind]).split(':')[0];
     assert(images[kind].digest.startsWith(`${repository}@`) ||
       images[kind].digest.startsWith(`docker.io/library/${repository}@`), 'Image repository mismatch');
   }
@@ -284,7 +422,7 @@ async function resolveImages() {
   const s = validateSnapshot(envJSON('RECORDER_SNAPSHOT'));
   const images = {};
   for (const kind of new Set(s.manifests.map(ecosystem).filter(Boolean))) {
-    const tag = IMAGE_TAGS[kind];
+    const tag = reviewedImageTag(s, kind, IMAGE_TAGS[kind]);
     run('docker', ['pull', '--platform', 'linux/amd64', tag], {timeout: 600000});
     const digests = JSON.parse(run('docker', ['image', 'inspect', tag, '--format', '{{json .RepoDigests}}']));
     assert(Array.isArray(digests), 'Image digest missing');
@@ -310,6 +448,7 @@ function initialize() {
   fs.mkdirSync(p.state, {recursive: true, mode: 0o700});
   const receipt = {
     schema: 1, policy: POLICY, snapshot: s, side, expected_sha: expectedSHA(s, side),
+    reviewed_exceptions_version: REVIEWED_EXCEPTIONS_VERSION,
     ...recorderCodeHashes(),
     executed_sha: null, control_sha: s.control_sha, recorder_sha: s.recorder_sha,
     run_id: s.run_id, run_attempt: s.run_attempt, profile_job: profileJob(s, side),
@@ -336,9 +475,12 @@ function saveState(state) {
   json(p.receipt, state.receipt);
 }
 
-export function copyExactSource(source, destination) {
+export function copyExactSource(source, destination, context) {
   let entries = 0, total = 0;
+  assertWorkloadDirectory(source, '.');
   const root = fs.realpathSync(source);
+  const fidelity = reviewedExceptionContract(context).source_copy_fidelity;
+  const preserved = [];
   const inside = resolved => (resolved === root || resolved.startsWith(`${root}${path.sep}`)) &&
     !path.relative(root, resolved).split(path.sep).includes('.git');
   function validateLink(from, target) {
@@ -379,7 +521,12 @@ export function copyExactSource(source, destination) {
     assert(++entries <= 400000, 'Source entry limit exceeded');
     if (stat.isSymbolicLink()) {
       const target = fs.readlinkSync(from);
-      validateLink(from, target);
+      const relative = path.relative(root, from).split(path.sep).join('/');
+      if (fidelity && relative === NEXT_OPAQUE_FIXTURE.path &&
+          target === NEXT_OPAQUE_FIXTURE.target && gitBlob(target) === NEXT_OPAQUE_FIXTURE.blob_sha) {
+        // Opaque bytes only: NEVER resolve/stat/read the absolute target.
+        preserved.push({...NEXT_OPAQUE_FIXTURE});
+      } else validateLink(from, target);
       fs.symlinkSync(target, to);
     } else if (stat.isDirectory()) {
       fs.mkdirSync(to, {mode: 0o755});
@@ -395,6 +542,11 @@ export function copyExactSource(source, destination) {
     }
   }
   visit(root, destination);
+  if (fidelity) {
+    assert(equalData(preserved, fidelity.preserved_opaque_symlinks),
+      'Reviewed source fixture missing or copy fidelity mismatch');
+    return fidelity;
+  }
 }
 
 async function prepare() {
@@ -410,9 +562,11 @@ async function prepare() {
   r.images = validateImages(envJSON('RECORDER_IMAGES'), s);
   // Validate the entire copy before the sensor can expose host credentials.
   state.sourceCopy = path.join(locations().state, 'source');
-  copyExactSource(source, state.sourceCopy);
+  const context = {snapshot: s, executed_sha: actual};
+  const fidelity = copyExactSource(source, state.sourceCopy, context);
+  if (fidelity) r.source_copy_fidelity = fidelity;
   saveState(state);
-  r.workloads = planWorkloads(state.sourceCopy, s.manifests).map(plan => ({
+  r.workloads = planWorkloads(state.sourceCopy, s.manifests, context).map(plan => ({
     ...plan, image: r.images[plan.ecosystem], exit_code: null, pids: [], started_at: null,
     finished_at: null, marker: null,
   }));
@@ -493,7 +647,11 @@ async function executeContainer(state, workload, index) {
   const name = `gr-${state.receipt.run_id}-${state.receipt.side}-${index}`;
   const marker = `garnet-workload-${state.receipt.run_id}-${state.receipt.side}-${index}`;
   const copy = path.join(p.state, `work-${index}`);
-  copyExactSource(state.sourceCopy, copy);
+  const fidelity = copyExactSource(state.sourceCopy, copy,
+    {snapshot: state.receipt.snapshot, executed_sha: state.receipt.executed_sha});
+  assert(equalData(fidelity, state.receipt.source_copy_fidelity), 'Per-workload source copy fidelity mismatch');
+  if (fidelity) workload.source_copy_fidelity = fidelity;
+  assertWorkloadDirectory(copy, workload.directory);
   // chown never follows source symlinks. The container gets only this copy.
   sudo('chown', '-hR', '10001:10001', copy);
   run('docker', ['pull', '--platform', 'linux/amd64', workload.image.digest], {timeout: 600000});
@@ -567,8 +725,15 @@ function readBounded(file, max = MAX_JSON) {
 
 // Raw Jibril 0.2.0 shape, as used by the pinned action's summarizeProfile.
 // A host curl/node/background flow does NOT satisfy workload coverage: each
-// planned workload needs a flow tied to a captured container PID or its unique
-// executable ancestry marker. No fabricated "smoke" traffic is added.
+// planned workload needs a package-tool leaf, Docker ancestry AND a captured
+// PID or unique marker on non-DNS TCP. Generic init/shell ancestors alone do
+// not prove package-tool egress. Keep the broad historical counter unchanged.
+const PACKAGE_TOOL = Object.freeze({
+  node: /^(node|npm|pnpm|corepack|yarn|bun)$/,
+  python: /^(python(?:\d+(?:\.\d+)*)?|pip(?:\d+(?:\.\d+)*)?|uv|poetry)$/,
+  go: /^go$/, rust: /^(cargo|rustup)$/,
+  ruby: /^(ruby(?:\d+(?:\.\d+)*)?|bundle|bundler|gem)$/,
+});
 export function validateProfile(raw, receipt) {
   const envelope = JSON.parse(raw);
   const p = envelope?.data && typeof envelope.data === 'object' ? envelope.data : envelope;
@@ -587,9 +752,10 @@ export function validateProfile(raw, receipt) {
     'Unexpected native profile SHA');
   const peers = p?.network?.egress?.peers;
   assert(Array.isArray(peers) && peers.length > 0 && peers.length < 1000000, 'No real egress peer records');
+  const packageEvidence = [];
   const evidence = receipt.workloads.map(w => {
     const pids = new Set(w.pids.map(String));
-    let count = 0;
+    let count = 0, packageCount = 0;
     for (const peer of peers) {
       if (!peer || !(peer.remote_address || peer.remote_names?.length) ||
         peer.protocol !== 'TCP' || !Array.isArray(peer.remote_ports) ||
@@ -600,16 +766,63 @@ export function validateProfile(raw, receipt) {
         const ancestry = [tree.process, tree.executable, ...(Array.isArray(tree.ancestry) ? tree.ancestry : [])];
         const markerMatch = w.marker && ancestry.some(x =>
           typeof x === 'string' && x.split(/[^A-Za-z0-9-]+/).includes(w.marker));
-        if (pids.has(String(tree.pid)) || markerMatch) count++;
+        if (pids.has(String(tree.pid)) || markerMatch) {
+          count++; // Existing broad counter: preserve publisher compatibility.
+          const container = Array.isArray(tree.ancestry) && tree.ancestry.some(x =>
+            typeof x === 'string' && ['containerd-shim-runc-v2', 'containerd-shim'].includes(path.posix.basename(x)));
+          const packageTool = typeof tree.executable === 'string' &&
+            PACKAGE_TOOL[w.ecosystem]?.test(path.posix.basename(tree.executable));
+          // Same numeric port contract as the independent publisher, NOT the
+          // historical broad "anything except 53" heuristic.
+          const nonDnsTcp = peer.remote_ports.some(port => {
+            const number = Number(/^(\d+)(?:\s|$)/.exec(String(port))?.[1]);
+            return Number.isInteger(number) && number > 0 && number <= 65535 && number !== 53;
+          });
+          if (container && packageTool && nonDnsTcp) packageCount++;
+        }
       }
     }
-    assert(count > 0, 'No network/process evidence attributable to a planned container workload');
+    packageEvidence.push({workload_id: w.id, package_tool_non_dns_tcp_associations: packageCount});
     return {workload_id: w.id, network_process_associations: count};
   });
-  return {state: 'valid', sha256: digest(raw), bytes: Buffer.byteLength(raw),
+  const result = {state: 'valid', sha256: digest(raw), bytes: Buffer.byteLength(raw),
     native_github: {repository: String(g.repository), run_id: String(g.run_id),
       job: String(g.job), sha: String(g.sha), run_attempt: g.run_attempt ?? null},
-    egress_peers: peers.length, workload_evidence: evidence};
+    egress_peers: peers.length, workload_evidence: evidence, package_tool_evidence: packageEvidence};
+  const reason = !evidence.length || evidence.some(e => e.network_process_associations === 0)
+    ? 'No network/process evidence attributable to a planned container workload'
+    : packageEvidence.some(e => e.package_tool_non_dns_tcp_associations === 0)
+      ? 'No package-tool non-DNS TCP evidence attributable to a planned container workload with Docker ancestry'
+      : null;
+  if (reason) {
+    const error = new Error(reason);
+    error.profile_result = {...result, state: 'invalid', validation_error: reason};
+    throw error;
+  }
+  return result;
+}
+
+// Finalization must retain raw digests/counters even when validation rejects
+// a profile. This reports invalid evidence; it never converts failure to GO.
+export function retainedProfile(raw, receipt) {
+  try { return validateProfile(raw, receipt); }
+  catch (error) {
+    return error.profile_result ?? {state: 'invalid', sha256: digest(raw), bytes: Buffer.byteLength(raw),
+      validation_error: 'Profile schema or identity validation failed'};
+  }
+}
+
+export function recordingOutcome(r, finalizationFailed) {
+  const recording_complete = !finalizationFailed && r.sensor.ready && r.sensor.stopped_cleanly &&
+    r.profile.state === 'valid' && r.workloads.length > 0 &&
+    r.workloads.every(w => Number.isInteger(w.exit_code) && w.started_at && w.finished_at);
+  const workload_success = r.workloads.length > 0 &&
+    r.workloads.every(w => w.exit_code === 0 && !w.output_truncated && !w.oom_killed);
+  return {
+    recording_complete, workload_success,
+    workload_exit: r.workloads.find(w => w.exit_code !== 0)?.exit_code ?? (workload_success ? 0 : null),
+    status: recording_complete && workload_success ? 'recorded' : 'incomplete-or-failed',
+  };
 }
 
 async function finalize() {
@@ -629,17 +842,31 @@ async function finalize() {
     assert(r.sensor.ready, 'Sensor never became ready');
     assert(sudo('systemctl', 'is-active', 'jibril.service') === 'active', 'Sensor ended before finalization');
     // Leave >=30 seconds after the workload for short recordings to settle.
-    await sleep(30000);
+    await sleep(FINALIZATION_LIMITS.settle_ms);
     r.sensor.settle_seconds = 30;
-    sudo('systemctl', 'stop', 'jibril.service');
-    const status = sudo('systemctl', 'show', 'jibril.service',
-      '--property=ActiveState,SubState,Result,ExecMainCode,ExecMainStatus');
-    const fields = Object.fromEntries(status.split('\n').map(line => line.split('=')));
-    r.sensor.stop_details = fields;
+    r.sensor.stop_command_timeout_ms = FINALIZATION_LIMITS.stop_command_ms;
+    try {
+      run('sudo', ['--', 'systemctl', 'stop', 'jibril.service'],
+        {timeout: FINALIZATION_LIMITS.stop_command_ms});
+    } finally {
+      // Even a stop subprocess error must not discard available unit state.
+      const status = run('sudo', ['--', 'systemctl', 'show', 'jibril.service',
+        '--property=ActiveState,SubState,Result,ExecMainCode,ExecMainStatus,TimeoutStopUSec'],
+      {timeout: FINALIZATION_LIMITS.diagnostic_command_ms});
+      r.sensor.stop_details = Object.fromEntries(status.split('\n').map(line => line.split('=')));
+    }
+    const fields = r.sensor.stop_details;
     assert(fields.ActiveState === 'inactive' && fields.SubState === 'dead' &&
       fields.Result === 'success' && fields.ExecMainStatus === '0', 'Sensor did not stop/flush cleanly');
     r.sensor.stopped_cleanly = true;
     r.sensor.stopped_at = now();
+  } catch {
+    failure = true;
+    r.sensor.finalization_error = 'Sensor did not become ready or stop/flush cleanly within the bounded finalization';
+  }
+  // An unclean stop can still leave diagnostic raw bytes. Retain them, but
+  // failure above remains sticky: even a valid partial profile cannot give GO.
+  try {
     const profile = '/var/log/jibril.profile.json';
     sudo('test', '-f', profile);
     sudo('test', '!', '-L', profile);
@@ -647,25 +874,53 @@ async function finalize() {
     sudo('cp', '--no-dereference', profile, path.join(p.output, 'jibril.profile.json'));
     sudo('chown', `${process.getuid()}:${process.getgid()}`, path.join(p.output, 'jibril.profile.json'));
     const raw = readBounded(path.join(p.output, 'jibril.profile.json'));
-    r.profile = validateProfile(raw, r);
+    r.profile = retainedProfile(raw, r);
+    assert(r.profile.state === 'valid', 'Raw profile did not satisfy strict workload evidence');
   } catch {
     failure = true;
     r.profile.state = fs.existsSync(path.join(p.output, 'jibril.profile.json')) ? 'invalid' : 'missing';
-    r.finalization_error = 'Missing/invalid profile, no workload evidence, or unclean sensor lifecycle; review trusted stop details';
   }
-  r.recording_complete = !failure && r.sensor.ready && r.sensor.stopped_cleanly &&
-    r.profile.state === 'valid' && r.workloads.length > 0 &&
-    r.workloads.every(w => Number.isInteger(w.exit_code) && w.started_at && w.finished_at);
-  r.workload_success = r.workloads.length > 0 &&
-    r.workloads.every(w => w.exit_code === 0 && !w.output_truncated && !w.oom_killed);
-  r.workload_exit = r.workloads.find(w => w.exit_code !== 0)?.exit_code ??
-    (r.workload_success ? 0 : null);
-  r.status = r.recording_complete && r.workload_success ? 'recorded' : 'incomplete-or-failed';
+  if (failure) r.finalization_error = 'Missing/invalid profile, no package-tool workload evidence, or unclean sensor lifecycle; review retained raw bytes and trusted stop details';
+  Object.assign(r, recordingOutcome(r, failure));
   r.finalized_at = now();
   const log = fs.readFileSync(path.join(p.output, 'workload.log'));
   r.workload_log = {sha256: digest(log), bytes: log.length};
   saveState(state);
   assert(r.recording_complete && r.workload_success, 'Recording incomplete or workload failed; artifacts retained');
+}
+
+export function validateReviewedExceptions(r, s = r.snapshot) {
+  assert(r.reviewed_exceptions_version === REVIEWED_EXCEPTIONS_VERSION, 'Reviewed exceptions capability mismatch');
+  const expected = reviewedExceptionContract({snapshot: s, executed_sha: r.executed_sha});
+  assert(Array.isArray(r.workloads) && r.workloads.length > 0, 'Missing workloads for reviewed exception checks');
+  assert(equalData(r.source_copy_fidelity, expected.source_copy_fidelity ?? undefined),
+    'Missing, unexpected or altered reviewed source copy fidelity');
+  if (expected.manager_selection || expected.source_copy_fidelity) {
+    assert(r.workloads.length === 1, 'Reviewed exception workload scope mismatch');
+  }
+  for (const w of r.workloads) {
+    assert(equalData(w.manager_selection, expected.manager_selection ?? undefined),
+      'Missing, unexpected or altered reviewed manager selection');
+    assert(equalData(w.source_copy_fidelity, expected.source_copy_fidelity ?? undefined),
+      'Missing, unexpected or altered workload copy fidelity');
+    if (expected.manager_selection) {
+      assert(w.id === 'node:sema4ai:' && w.directory === 'sema4ai' && w.ecosystem === 'node' &&
+        w.locked === true && w.scope === 'reviewed-yarn-locked-install-with-lifecycle-hooks-no-explicit-workspace-build' &&
+        equalData(w.commands, reviewedExtensionCommands()) &&
+        equalData([...(w.changed_manifests ?? [])].sort(), [...REVIEWED_EXTENSION.manifests].sort()),
+      'Reviewed Yarn workload commands/scope mismatch');
+    }
+    if (expected.source_copy_fidelity) {
+      assert(w.id === 'node:.:' && w.directory === '.' && w.ecosystem === 'node' &&
+        equalData([...(w.changed_manifests ?? [])].sort(), [...REVIEWED_NEXT.manifests].sort()),
+      'Reviewed source-copy workload scope mismatch');
+    }
+  }
+  return {
+    version: REVIEWED_EXCEPTIONS_VERSION,
+    manager_selection_policy: expected.manager_selection?.policy_id ?? null,
+    source_copy_policy: expected.source_copy_fidelity?.policy_id ?? null,
+  };
 }
 
 export function validateReceipt(r, s, side, images, codeHashes = recorderCodeHashes()) {
@@ -691,6 +946,7 @@ export function validateReceipt(r, s, side, images, codeHashes = recorderCodeHas
     r.isolation.network.host_input_blocked === true, 'Missing network containment evidence');
   assert(Array.isArray(r.workloads) && r.workloads.length > 0 && r.workloads.length <= 12,
     'No workload evidence');
+  validateReviewedExceptions(r, s);
   for (const w of r.workloads) {
     assert(w.exit_code === 0 && w.oom_killed === false && w.output_truncated === false &&
       w.timed_out === false, 'Workload exit failure');
@@ -710,6 +966,7 @@ async function verify() {
   const output = path.resolve(process.env.RECORDER_SUMMARY);
   fs.mkdirSync(output, {recursive: true});
   const summary = {schema: 1, policy: POLICY, snapshot: s, verified: false,
+    reviewed_exceptions_version: REVIEWED_EXCEPTIONS_VERSION,
     decision: 'HOLD', meaning: 'Recording verification only; not dependency safety or PR approval',
     cloud_ingestion_verified: false, verified_at: now(), sides: []};
   let error;
@@ -731,12 +988,17 @@ async function verify() {
       const checked = validateProfile(raw, r);
       assert(r.profile.sha256 === checked.sha256 && r.profile.bytes === checked.bytes &&
         JSON.stringify(r.profile.workload_evidence) === JSON.stringify(checked.workload_evidence), 'Profile digest/evidence mismatch');
+      assert(equalData(r.profile.package_tool_evidence, checked.package_tool_evidence),
+        'Package-tool profile evidence mismatch');
       const log = readBounded(path.join(directory, 'workload.log'), MAX_LOG);
       assert(log.length <= MAX_LOG && r.workload_log.sha256 === digest(log) &&
         r.workload_log.bytes === log.length, 'Workload log digest mismatch');
       summary.sides.push({side, executed_sha: r.executed_sha, profile_sha256: checked.sha256,
         recorder_script_sha256: r.recorder_script_sha256, recorder_helpers_sha256: r.recorder_helpers_sha256,
-        profile_job: r.profile_job, workloads: r.workloads, evidence: checked.workload_evidence});
+        reviewed_exception_validation: validateReviewedExceptions(r, s),
+        ...(r.source_copy_fidelity ? {source_copy_fidelity: r.source_copy_fidelity} : {}),
+        profile_job: r.profile_job, workloads: r.workloads, evidence: checked.workload_evidence,
+        package_tool_evidence: checked.package_tool_evidence});
     }
     const [base, head] = summary.sides;
     assert(JSON.stringify(base.workloads.map(w => w.id)) === JSON.stringify(head.workloads.map(w => w.id)),

@@ -36,6 +36,126 @@ const nonDnsPorts = e => e.ports.map(p => Number(/^(\d+)(?:\s|$)/.exec(p)?.[1]))
 const nonDnsTcp = e => e.protocol === 'TCP' && nonDnsPorts(e).length > 0;
 const distinct = (rows, key) => [...new Map(rows.map(row => [key(row), row])).values()];
 
+// Independent, inline allowlist. Never import/evaluate the fetched recorder or
+// trust artifact-provided manager authority. Source capability alone opts in.
+export function reviewedExceptionsCapability(bytes) {
+  const text = bytes.toString('utf8');
+  if (!text.includes('REVIEWED_EXCEPTIONS_VERSION')) return 0;
+  const declarations = [...text.matchAll(/^\s*export\s+const\s+REVIEWED_EXCEPTIONS_VERSION\s*=\s*([^;\r\n]+);/gm)];
+  check(declarations.length === 1 && declarations[0][1].trim() === '1',
+    'unsupported_reviewed_exceptions_capability');
+  return 1;
+}
+
+const REVIEWED_YARN = {
+  repository: 'garnet-labs/vscode-extension-test', repository_id: '899092823', pr: 5,
+  base: '393e349d14a10f2db1ce266c42db378ac6391a93', head: 'f43f9f252cab4c3ee9f29a7bcf58f859a35b759b',
+  manifests: ['sema4ai/package-lock.json', 'sema4ai/yarn.lock'],
+};
+const REVIEWED_COPY = {
+  repository: 'garnet-labs/next.js', repository_id: '1206332346', pr: 40,
+  base: '2d069943639fd0fc67a26bbb337d8a726f50924d', head: 'bcae068be948a03cba54813aea6cffb5c03adf63',
+  manifests: ['package.json', 'pnpm-lock.yaml'],
+};
+const YARN_SCOPE = 'reviewed-yarn-locked-install-with-lifecycle-hooks-no-explicit-workspace-build';
+export function reviewedYarnCommands() {
+  return [
+    "garnet_locks_before=$(/usr/bin/sha256sum 'yarn.lock' 'package-lock.json'); readonly garnet_locks_before",
+    'export COREPACK_ENABLE_PROJECT_SPEC=0 COREPACK_DEFAULT_TO_LATEST=0 YARN_IGNORE_PATH=1',
+    "corepack install --global 'yarn@1.22.22'",
+    'mkdir -p /home/workload/.local/bin',
+    'corepack enable --install-directory /home/workload/.local/bin yarn',
+    'corepack yarn install --frozen-lockfile --non-interactive --production=false',
+    "printf '%s\\n' \"$garnet_locks_before\" | /usr/bin/sha256sum --check --status",
+  ];
+}
+const exactManifestSet = (a, b) => strings(a) && equal([...a].sort(), [...b].sort());
+export function expectedReviewedExceptions(s, executed) {
+  const matches = p => s?.repository === p.repository && s.repository_id === p.repository_id &&
+    s.pr_number === p.pr && s.baseline_sha === p.base && s.head?.sha === p.head &&
+    [p.base, p.head].includes(executed) && exactManifestSet(s.manifests, p.manifests);
+  return {
+    manager_selection: matches(REVIEWED_YARN) ? {
+      policy_id: 'vscode-extension-test-pr5-sema4ai-yarn-v1',
+      manager: 'yarn', version: '1.22.22', version_authority: 'trusted-classic-lock-fallback',
+      selected_lockfile: 'sema4ai/yarn.lock',
+      unused_competing_lockfiles: ['sema4ai/package-lock.json'],
+      changed_lockfiles_not_independently_exercised: ['sema4ai/package-lock.json'],
+      authority_blobs: {
+        '.github/workflows/release-robocorp-code-vscode.yml': '41a3063623d70bc9d6c61f7b0aa85c42db85481d',
+        '.github/workflows/pre-release-robocorp-code.yml': 'da08cb83e92c0a6576bdf824f2d2dbe6b20dd07a',
+        'sema4ai/package.json': '448bde4b09f254aee686b3bf63362c619bc60ff6',
+      },
+      authority_commit_pair: [REVIEWED_YARN.base, REVIEWED_YARN.head],
+      source_lock_blobs: executed === REVIEWED_YARN.base ? {
+        'sema4ai/yarn.lock': 'a2e2ba93941e47895ba816f633f3bff22f30c08e',
+        'sema4ai/package-lock.json': '322988a2e68ed3d3a2b5bdd11cceedaca9ded1f2',
+      } : {
+        'sema4ai/yarn.lock': '38877bfff2c010707b9998c37cd3102f56630490',
+        'sema4ai/package-lock.json': '785df566266e81c25259a41390be9ded26889201',
+      },
+    } : null,
+    source_copy_fidelity: matches(REVIEWED_COPY) ? {
+      policy_id: 'nextjs-pr40-exact-fixture-link-preservation-v1',
+      method: 'no-dereference-copy', git_metadata_excluded: true,
+      excluded_tracked_source_paths: [], rewritten_symlink_targets: [],
+      preserved_opaque_symlinks: [{
+        path: 'test/development/app-dir/ssr-in-rsc/node_modules/random-react-library',
+        target: '/Users/sebbie/repos/next.js/test/development/app-dir/ssr-in-rsc/random-react-library/',
+        blob_sha: '07ab05517e672a857a940573789969bfb1de3848', host_target_resolved: false,
+      }],
+      fidelity: 'regular-file bytes and symlink target bytes preserved; existing git-metadata exclusion and executable-mode normalization unchanged',
+    } : null,
+  };
+}
+function exactExceptionField(object, key, expected) {
+  check(expected == null ? !Object.hasOwn(object, key) : equal(object[key], expected),
+    'missing_or_forged_reviewed_exception_metadata');
+}
+function absentExceptionFields(object, fields) {
+  for (const key of fields) exactExceptionField(object, key, null);
+}
+export function validateReviewedReceipt(r, s, version = 0) {
+  check([0, 1].includes(version), 'unsupported_reviewed_exceptions_capability');
+  if (version === 1) check(r.reviewed_exceptions_version === 1, 'receipt_exception_capability_mismatch');
+  else exactExceptionField(r, 'reviewed_exceptions_version', null);
+  absentExceptionFields(r, ['manager_selection', 'reviewed_exception_validation']);
+  const expected = version === 1 ? expectedReviewedExceptions(s, r.executed_sha)
+    : {manager_selection: null, source_copy_fidelity: null};
+  exactExceptionField(r, 'source_copy_fidelity', expected.source_copy_fidelity);
+  check(Array.isArray(r.workloads) && r.workloads.length > 0, 'missing_reviewed_workloads');
+  if (expected.manager_selection || expected.source_copy_fidelity)
+    check(r.workloads.length === 1, 'reviewed_workload_scope_mismatch');
+  for (const w of r.workloads) {
+    absentExceptionFields(w, ['reviewed_exceptions_version', 'reviewed_exception_validation']);
+    exactExceptionField(w, 'manager_selection', expected.manager_selection);
+    exactExceptionField(w, 'source_copy_fidelity', expected.source_copy_fidelity);
+    if (!expected.manager_selection) check(w.scope !== YARN_SCOPE, 'unbound_reviewed_yarn_scope');
+    if (expected.manager_selection) check(w.id === 'node:sema4ai:' && w.directory === 'sema4ai' &&
+      w.ecosystem === 'node' && w.locked === true && w.scope === YARN_SCOPE &&
+      equal(w.commands, reviewedYarnCommands()) && exactManifestSet(w.changed_manifests, REVIEWED_YARN.manifests),
+    'reviewed_yarn_scope_or_commands_mismatch');
+    if (expected.source_copy_fidelity) check(w.id === 'node:.:' && w.directory === '.' &&
+      w.ecosystem === 'node' && exactManifestSet(w.changed_manifests, REVIEWED_COPY.manifests),
+    'reviewed_copy_scope_mismatch');
+  }
+  return {version, manager_selection_policy: expected.manager_selection?.policy_id ?? null,
+    source_copy_policy: expected.source_copy_fidelity?.policy_id ?? null};
+}
+export function validateReviewedVerifier(v, row, r, s, version = 0) {
+  const validation = validateReviewedReceipt(r, s, version);
+  if (version === 1) {
+    check(v.reviewed_exceptions_version === 1, 'verifier_exception_capability_mismatch');
+    check(equal(row.reviewed_exception_validation, validation), 'verifier_exception_policy_mismatch');
+  } else {
+    exactExceptionField(v, 'reviewed_exceptions_version', null);
+    exactExceptionField(row, 'reviewed_exception_validation', null);
+  }
+  absentExceptionFields(v, ['manager_selection', 'source_copy_fidelity', 'reviewed_exception_validation']);
+  absentExceptionFields(row, ['manager_selection', 'reviewed_exceptions_version']);
+  exactExceptionField(row, 'source_copy_fidelity', r.source_copy_fidelity);
+}
+
 function api(endpoint, method = 'GET', body) {
   try {
     return parse(execFileSync('gh', ['api', endpoint,
@@ -145,7 +265,7 @@ export function inspectProfile(raw, r) {
     }
   }
   const expected = {
-    node: /^(node|npm|pnpm|corepack|yarn)$/, python: /^(python(?:\d+(?:\.\d+)*)?|pip(?:\d+(?:\.\d+)*)?|uv|poetry)$/,
+    node: /^(node|npm|pnpm|corepack|yarn|bun)$/, python: /^(python(?:\d+(?:\.\d+)*)?|pip(?:\d+(?:\.\d+)*)?|uv|poetry)$/,
     go: /^go$/, rust: /^(cargo|rustup)$/, ruby: /^(ruby(?:\d+(?:\.\d+)*)?|bundle|bundler|gem)$/,
   };
   const workloads = r.workloads.map(w => {
@@ -192,13 +312,14 @@ export function inspectProfile(raw, r) {
     }, {})};
 }
 
-export function validateSide(r, artifact, s, side, scriptHash, helperHashes) {
+export function validateSide(r, artifact, s, side, scriptHash, helperHashes, reviewedVersion = 0) {
   check(r?.schema === 1 && [POLICY, POLICY_V2].includes(r.policy) && equal(r.snapshot, s), 'receipt_schema_or_snapshot_mismatch');
   if (r.policy === POLICY_V2) check(helperHashes && Object.keys(helperHashes).length === 1 &&
     /^[a-f0-9]{64}$/.test(helperHashes[HELPER] || '') && equal(r.recorder_helpers_sha256, helperHashes),
   'recorder_helper_hash_mismatch');
   check(r.side === side && r.expected_sha === (side === 'base' ? s.baseline_sha : s.head.sha) &&
     r.executed_sha === r.expected_sha, 'executed_sha_mismatch');
+  validateReviewedReceipt(r, s, reviewedVersion);
   check(r.run_id === s.run_id && r.run_attempt === s.run_attempt && r.control_sha === s.control_sha &&
     r.recorder_sha === s.recorder_sha && r.recorder_script_sha256 === scriptHash,
   'receipt_run_or_recorder_hash_mismatch');
@@ -316,32 +437,36 @@ function defaultTrust(repo, run) {
   return {repository, defaultTip: branch.commit.sha};
 }
 
-export function validateCIContext(env, event, repository, run, publishingRun) {
+export function validateCIContext(env, event, repository, run, publishingRun, {allowInProgress = false} = {}) {
   const repo = repository.full_name, ref = `refs/heads/${repository.default_branch}`;
-  check(env.GITHUB_ACTIONS === 'true' && env.GITHUB_EVENT_NAME === 'workflow_run' &&
+  check(env.GITHUB_ACTIONS === 'true' && env.GITHUB_EVENT_NAME === 'workflow_dispatch' &&
     env.GITHUB_REPOSITORY === repo && env.GITHUB_REPOSITORY_ID === String(repository.id) &&
     env.GITHUB_REF === ref && env.GITHUB_WORKFLOW_REF === `${repo}/${PUBLISH_WORKFLOW}@${ref}` &&
     SHA.test(env.GITHUB_SHA) && env.GITHUB_WORKFLOW_SHA === env.GITHUB_SHA,
   'untrusted_ci_publisher_context');
-  check(event.action === 'completed' && event.repository?.id === repository.id &&
-    event.repository?.full_name === repo && String(event.workflow_run?.id) === String(run.id) &&
-    event.workflow_run?.run_attempt === run.run_attempt && event.workflow_run?.head_sha === run.head_sha &&
-    event.workflow_run?.event === run.event && event.workflow_run?.head_branch === repository.default_branch &&
-    event.workflow_run?.head_repository?.id === repository.id && run.status === 'completed',
-  'ci_completed_run_event_mismatch');
+  // Dispatch inputs are lookup/binding targets, never authority. Every referenced
+  // run, attempt, source revision and artifact is independently checked live.
+  check(event.repository?.id === repository.id && event.repository?.full_name === repo &&
+    /^[1-9]\d{0,19}$/.test(event.inputs?.run_id || '') &&
+    String(event.inputs.run_id) === String(run.id) &&
+    /^[1-9]\d{0,5}$/.test(event.inputs?.run_attempt || '') &&
+    String(event.inputs.run_attempt) === String(run.run_attempt) &&
+    SHA.test(event.inputs?.worker_sha || '') && event.inputs.worker_sha === run.head_sha &&
+    (run.status === 'completed' || (allowInProgress && ['queued', 'in_progress'].includes(run.status))),
+  'ci_dispatch_run_binding_mismatch');
   check(String(publishingRun.id) === env.GITHUB_RUN_ID && publishingRun.path === PUBLISH_WORKFLOW &&
-    publishingRun.event === 'workflow_run' && publishingRun.head_sha === env.GITHUB_SHA &&
+    publishingRun.event === 'workflow_dispatch' && publishingRun.head_sha === env.GITHUB_SHA &&
     publishingRun.head_branch === repository.default_branch && publishingRun.repository?.id === repository.id &&
     publishingRun.head_repository?.id === repository.id, 'ci_publisher_run_mismatch');
 }
 
-export function authorizeCI(repo, runId) {
-  check(process.env.GITHUB_ACTIONS === 'true' && process.env.GITHUB_EVENT_NAME === 'workflow_run' &&
-    /^[1-9]\d{0,19}$/.test(process.env.GITHUB_RUN_ID || ''), 'ci_mode_requires_workflow_run');
+export function authorizeCI(repo, runId, options) {
+  check(process.env.GITHUB_ACTIONS === 'true' && process.env.GITHUB_EVENT_NAME === 'workflow_dispatch' &&
+    /^[1-9]\d{0,19}$/.test(process.env.GITHUB_RUN_ID || ''), 'ci_mode_requires_workflow_dispatch');
   const event = parse(read(process.env.GITHUB_EVENT_PATH, MB));
   const run = liveRun(repo, runId), trust = defaultTrust(repo, run);
   const publishingRun = api(`repos/${repo}/actions/runs/${process.env.GITHUB_RUN_ID}`);
-  validateCIContext(process.env, event, trust.repository, run, publishingRun);
+  validateCIContext(process.env, event, trust.repository, run, publishingRun, options);
   const workflow = api(`repos/${repo}/actions/workflows/${publishingRun.workflow_id}`);
   check(workflow.id === publishingRun.workflow_id && workflow.path === PUBLISH_WORKFLOW,
     'ci_publisher_workflow_identity_mismatch');
@@ -417,7 +542,7 @@ export function validateCloudReadback(c, entry, hostedURL) {
 }
 
 export function renderPreview({repo, pr, run, snapshot: s, sides, failures, publishable, artifacts,
-  hostedReports = {}, cloudReadbacks = {}, historical = false}) {
+  hostedReports = {}, cloudReadbacks = {}, historical = false, reviewedVersion = 0}) {
   const verified = failures.length === 0 && publishable;
   const runURL = `https://github.com/${repo}/actions/runs/${run.id}/attempts/${run.run_attempt}`;
   const decision = verified ? 'Recording verified; security verdict HOLD (requires human interpretation)'
@@ -443,6 +568,15 @@ export function renderPreview({repo, pr, run, snapshot: s, sides, failures, publ
         `${code(w.image?.digest)} | ${code(w.exit_code)} | ${counts
           ? `${counts.processes} / ${counts.destinations} / ${counts.associations}` : 'not verified'} |`);
     }
+  }
+  if (reviewedVersion === 1) {
+    const reviewed = expectedReviewedExceptions(s, sides.head?.receipt?.executed_sha);
+    if ((reviewed.manager_selection || reviewed.source_copy_fidelity) && !verified)
+      lines.push('', '**Reviewed exception not verified:** do not infer manager-selection or source-copy fidelity from this incomplete recording.');
+    else if (reviewed.manager_selection) lines.push('',
+      '**Reviewed install scope:** Yarn graph selected by the two immutable release workflows. The npm package-lock was retained and unchanged, but its graph was **not independently exercised**. Yarn 1.22.22 is a trusted classic-lock fallback, not an upstream version pin. Both lockfiles’ final bytes were checked; this is not a detector of transient modifications. No explicit workspace build or repository-wide tests were run.');
+    else if (reviewed.source_copy_fidelity) lines.push('',
+      '**Reviewed source-copy fidelity:** one exact absolute fixture symlink was preserved as opaque target bytes; no host-target resolution, tracked-source exclusions or symlink-target rewrites. Existing Git-metadata omission and executable-mode normalization were retained.');
   }
   lines.push('', `Baseline: merge-base ${code(s?.baseline_sha)}; PR base tip at resolution: ${code(s?.pr_base_tip)}.`,
     'This is a freshly recorded merge-base-to-head pair, **not a previous profile from this PR**. Only the listed workload ran; repository-wide tests are not asserted.',
@@ -604,7 +738,7 @@ export function main(argv = process.argv.slice(2)) {
     snapshot ??= verification[0]?.snapshot;
     check(verification.length > 0, 'missing_verification_json');
   } catch (e) { recordFailure('verification_artifact', e); }
-  let bound = false, scriptHash, scriptPolicy, helperHashes;
+  let bound = false, scriptHash, scriptPolicy, helperHashes, reviewedVersion = 0;
   try {
     check(state.repo === o.repo && SHA.test(state.control_sha), 'invalid_manager_install_anchor');
     check(snapshot && SHA.test(snapshot.recorder_sha) && SHA.test(snapshot.control_sha), 'invalid_snapshot_controller');
@@ -635,6 +769,8 @@ export function main(argv = process.argv.slice(2)) {
     scriptPolicy = /(?:export\s+)?const POLICY = ['"](garnet-dependabot-container-v[12])['"]/
       .exec(scriptBytes.toString('utf8'))?.[1];
     check([POLICY, POLICY_V2].includes(scriptPolicy), 'unsupported_trusted_recorder_policy');
+    reviewedVersion = reviewedExceptionsCapability(scriptBytes);
+    check(reviewedVersion === 0 || scriptPolicy === POLICY_V2, 'exception_capability_requires_policy_v2');
     if (scriptPolicy === POLICY_V2) {
       const helper = content(HELPER, snapshot.recorder_sha);
       check(helper.type === 'file' && helper.encoding === 'base64' && typeof helper.content === 'string',
@@ -654,7 +790,7 @@ export function main(argv = process.argv.slice(2)) {
     try {
       check(sides[side] && artifacts[side], 'missing_side_evidence');
       check(sides[side].receipt.policy === scriptPolicy, 'receipt_trusted_policy_mismatch');
-      sides[side].observed = validateSide(sides[side].receipt, artifacts[side], snapshot, side, scriptHash, helperHashes);
+      sides[side].observed = validateSide(sides[side].receipt, artifacts[side], snapshot, side, scriptHash, helperHashes, reviewedVersion);
     } catch (e) { recordFailure(side, e); }
   }
   try {
@@ -669,6 +805,7 @@ export function main(argv = process.argv.slice(2)) {
         const matches = v.sides.filter(x => x.side === side), e = sides[side];
         check(matches.length === 1 && e?.observed, 'verifier_missing_observed_side');
         const row = matches[0];
+        validateReviewedVerifier(v, row, e.receipt, snapshot, reviewedVersion);
         if (scriptPolicy === POLICY_V2) check(row.recorder_script_sha256 === scriptHash &&
           equal(row.recorder_helpers_sha256, helperHashes), 'verifier_side_code_hash_mismatch');
         check(row.executed_sha === e.receipt.executed_sha && row.profile_sha256 === e.observed.sha256 &&
@@ -695,10 +832,11 @@ export function main(argv = process.argv.slice(2)) {
     } catch { /* Missing/stale/invalid public read-back is not a recording failure. */ }
   }
   const preview = renderPreview({repo: o.repo, pr, run, snapshot, sides, failures, publishable: bound,
-    artifacts, hostedReports, cloudReadbacks, historical: o.historical});
-  preview.provenance = {mode: o.ci ? 'trusted-workflow-run' : 'local-manager',
+    artifacts, hostedReports, cloudReadbacks, historical: o.historical, reviewedVersion});
+  preview.provenance = {mode: o.ci ? 'trusted-workflow-dispatch' : 'local-manager',
     default_branch: trust.repository.default_branch, default_tip: trust.defaultTip,
-    recorder_script_sha256: scriptHash, recorder_helpers_sha256: helperHashes};
+    recorder_script_sha256: scriptHash, recorder_helpers_sha256: helperHashes,
+    reviewed_exceptions_version: reviewedVersion || null};
   save(path.join(o.evidence, 'publisher-preview.md'), preview.comment.body);
   save(path.join(o.evidence, 'publisher-preview.json'), preview);
   if (o.publish) {
