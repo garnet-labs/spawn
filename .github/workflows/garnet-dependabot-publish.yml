@@ -1,0 +1,47 @@
+name: Garnet Dependabot Publish
+
+on:
+  workflow_run:
+    workflows: ["Garnet Dependabot Record"]
+    types: [completed]
+
+permissions: {}
+
+# Worker titles are per-PR scheduling keys only, never authorization evidence.
+# Distinct PRs must not cancel each other's queued publications.
+concurrency:
+  group: garnet-dependabot-publication-${{ github.repository }}-${{ github.event.workflow_run.display_title || github.event.workflow_run.id }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: >-
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      github.event.workflow_run.event == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: read
+      issues: write
+      statuses: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout only this publisher's trusted default-branch revision
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+      - name: Collect bounded artifacts as data and publish a security-HOLD receipt
+        run: node .github/scripts/garnet-dependabot-collect.mjs
+      - name: Retain publication diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: garnet-publication-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/garnet-dependabot-publication/
+          if-no-files-found: warn
+          retention-days: 14
